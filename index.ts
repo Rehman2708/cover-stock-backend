@@ -8,6 +8,10 @@ const { ensureIndexes, getDatabase } = require("./src/database");
 const app = express();
 const port = Number(process.env.PORT || 3000);
 
+// Keep this probe intentionally bodyless: Render and external uptime jobs only
+// need a successful status code, and some monitors cap captured response sizes.
+app.get("/health", (_, response) => response.status(204).end());
+
 app.use(express.json());
 app.use((_, response, next) => {
   response.setHeader("Access-Control-Allow-Origin", "*");
@@ -22,10 +26,6 @@ app.use((_, response, next) => {
   next();
 });
 app.options("/{*splat}", (_, response) => response.sendStatus(204));
-
-app.get("/health", (_, response) =>
-  response.status(200).json({ status: "ok" }),
-);
 
 const serialize = (document) => {
   if (!document) return document;
@@ -212,6 +212,34 @@ const deviceNames = (device, familyDevices) => {
     ),
   ];
 };
+const compatibilityKey = (value) =>
+  String(value || "")
+    .trim()
+    .replace(/\s+/g, " ")
+    .toLocaleLowerCase();
+const compatibleCoverFilter = (names) => {
+  const values = [
+    ...new Set(
+      names
+        .map(compatibilityKey)
+        .filter(Boolean)
+    ),
+  ];
+  if (!values.length) return { _id: { $exists: false } };
+  return {
+    status: "active",
+    // Existing stock can have a different letter case from the device catalogue.
+    // Match the whole model name so "A5" never accidentally matches "A55".
+    $or: values.map((name) => ({
+      compatibleModels: {
+        $regex: `^${escapeRegex(name).replace(/\s+/g, "\\s+")}$`,
+        $options: "i",
+      },
+    })),
+  };
+};
+const findCompatibleCovers = (db, names) =>
+  db.collection("covers").find(compatibleCoverFilter(names));
 
 async function attachDisplayDevices(db, covers) {
   if (!covers.length) return covers;
@@ -225,13 +253,13 @@ async function attachDisplayDevices(db, covers) {
       device.model,
       `${device.brand} ${device.model}`,
       ...(device.aliases || []),
-    ].forEach((name) => byName.set(String(name).toLocaleLowerCase(), device));
+    ].forEach((name) => byName.set(compatibilityKey(name), device));
   });
   return covers.map((cover) => {
     const matchingDevices = [
       ...new Map(
         (cover.compatibleModels || [])
-          .map((name) => byName.get(String(name).toLocaleLowerCase()))
+          .map((name) => byName.get(compatibilityKey(name)))
           .filter(Boolean)
           .map((device) => [
             device._id.toString(),
@@ -703,20 +731,15 @@ app.get(
       ...new Set(items.flatMap((device) => deviceNames(device, familyDevices))),
     ];
     const covers = names.length
-      ? await db
-          .collection("covers")
-          .find({ status: "active", compatibleModels: { $in: names } })
-          .toArray()
+      ? await findCompatibleCovers(db, names).toArray()
       : [];
     const serialized = items.map((device) => {
       const compatibleNames = new Set(
-        deviceNames(device, familyDevices).map((name) =>
-          String(name).toLocaleLowerCase(),
-        ),
+        deviceNames(device, familyDevices).map(compatibilityKey),
       );
       const matchingCovers = covers.filter((cover) =>
         cover.compatibleModels?.some((model) =>
-          compatibleNames.has(String(model).toLocaleLowerCase()),
+          compatibleNames.has(compatibilityKey(model)),
         ),
       );
       const inventory = {
@@ -764,26 +787,26 @@ app.get(
         ]),
       ),
     ];
-    const covers = await db
-      .collection("covers")
-      .find({ status: "active", compatibleModels: { $in: names } })
+    const covers = await findCompatibleCovers(db, names)
       .sort({ quantityOnHand: -1, name: 1 })
       .toArray();
-    const seenModels = new Set();
-    const compatibleDevices = familyDevices.filter((item) => {
-      const modelKey = `${item.brand} ${item.model}`.toLocaleLowerCase();
-      if (
-        modelKey === `${device.brand} ${device.model}`.toLocaleLowerCase() ||
-        seenModels.has(modelKey)
-      )
-        return false;
-      seenModels.add(modelKey);
-      return true;
-    });
+    const displayCovers = await attachDisplayDevices(db, covers);
+    // Compatibility is primarily defined by the cover record itself. The
+    // curated device group remains useful for confirmed shared-cover families,
+    // but it must not be the only path to showing linked phones.
+    const compatibleById = new Map();
+    [...familyDevices, ...displayCovers.flatMap((cover) => cover.compatibleDevices || [])]
+      .map((item) => (item._id ? serialize(item) : item))
+      .forEach((item) => {
+        if (item.id !== device._id.toString()) compatibleById.set(item.id, item);
+      });
+    const compatibleDevices = [...compatibleById.values()].sort((left, right) =>
+      `${left.brand} ${left.model}`.localeCompare(`${right.brand} ${right.model}`),
+    );
     response.json({
       device: serialize(device),
-      covers: (await attachDisplayDevices(db, covers)).map(serialize),
-      compatibleDevices: compatibleDevices.map(serialize),
+      covers: displayCovers.map(serialize),
+      compatibleDevices,
     });
   }),
 );
@@ -821,9 +844,7 @@ app.post(
           .toArray()
       : [device];
     const compatibleModels = deviceNames(device, familyDevices);
-    const matchingCovers = await db
-      .collection("covers")
-      .find({ status: "active", compatibleModels: { $in: compatibleModels } })
+    const matchingCovers = await findCompatibleCovers(db, compatibleModels)
       .sort({ quantityOnHand: -1, updatedAt: -1 })
       .toArray();
     let cover = matchingCovers[0];
@@ -933,20 +954,15 @@ app.get(
       ),
     ];
     const inventoryCovers = inventoryNames.length
-      ? await db
-          .collection("covers")
-          .find({ status: "active", compatibleModels: { $in: inventoryNames } })
-          .toArray()
+      ? await findCompatibleCovers(db, inventoryNames).toArray()
       : [];
     const serializedDevices = visibleDevices.map((device) => {
       const names = new Set(
-        deviceNames(device, familyDevices).map((name) =>
-          String(name).toLocaleLowerCase(),
-        ),
+        deviceNames(device, familyDevices).map(compatibilityKey),
       );
       const matchingCovers = inventoryCovers.filter((cover) =>
         cover.compatibleModels?.some((model) =>
-          names.has(String(model).toLocaleLowerCase()),
+          names.has(compatibilityKey(model)),
         ),
       );
       return serialize({

@@ -233,6 +233,15 @@ const groups: CompatibilityGroup[] = [
       { brand: "Samsung", model: "M35" },
     ],
   },
+  {
+    // Independently listed by Indian cover sellers and a compatibility finder.
+    id: "vivo-t4x-y29-y31-pro",
+    devices: [
+      { brand: "Vivo", model: "T4X" },
+      { brand: "Vivo", model: "Y29" },
+      { brand: "Vivo", model: "Y31 Pro" },
+    ],
+  },
 ];
 
 async function main() {
