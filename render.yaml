@@ -1,0 +1,16 @@
+services:
+  - type: web
+    runtime: node
+    name: cover-stock-backend
+    region: singapore
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SHOP_TIME_ZONE
+        value: Asia/Kolkata
+      - key: MONGODB_URI
+        sync: false

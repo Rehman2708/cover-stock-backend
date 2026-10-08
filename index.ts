@@ -23,6 +23,10 @@ app.use((_, response, next) => {
 });
 app.options("/{*splat}", (_, response) => response.sendStatus(204));
 
+app.get("/health", (_, response) =>
+  response.status(200).json({ status: "ok" }),
+);
+
 const serialize = (document) => {
   if (!document) return document;
   const { _id, activity, ...rest } = document;
