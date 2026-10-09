@@ -21,7 +21,7 @@ app.use((_, response, next) => {
   );
   response.setHeader(
     "Access-Control-Allow-Methods",
-    "GET, POST, PATCH, OPTIONS",
+    "GET, POST, PATCH, DELETE, OPTIONS",
   );
   next();
 });
@@ -33,6 +33,15 @@ const serialize = (document) => {
   return { id: _id.toString(), ...rest };
 };
 const invalidId = (id) => !ObjectId.isValid(id);
+const validImageUrl = (value) => {
+  if (!value) return true;
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:";
+  } catch {
+    return false;
+  }
+};
 const route = (handler) => async (request, response, next) => {
   try {
     await handler(request, response);
@@ -120,8 +129,6 @@ const activityProjection = {
   note: 1,
   actor: 1,
   createdAt: 1,
-  coverName: "$cover.name",
-  coverSku: "$cover.sku",
   compatibleModels: "$cover.compatibleModels",
 };
 async function readActivityWithBalances(db, match: any = {}) {
@@ -160,8 +167,6 @@ async function readActivityWithBalances(db, match: any = {}) {
           note: "$activity.note",
           actor: "$activity.actor",
           createdAt: "$activity.createdAt",
-          coverName: "$name",
-          coverSku: "$sku",
           compatibleModels: "$compatibleModels",
         },
       },
@@ -217,6 +222,22 @@ const compatibilityKey = (value) =>
     .trim()
     .replace(/\s+/g, " ")
     .toLocaleLowerCase();
+const displayDevice = (device) => ({
+  id: device._id.toString(),
+  brand: device.brand,
+  model: device.model,
+  images: device.images,
+});
+const compatibleFamilyDevices = (device, familyDevices) =>
+  !device.coverCompatibilityGroup
+    ? []
+    : familyDevices
+        .filter(
+          (item) =>
+            item.coverCompatibilityGroup === device.coverCompatibilityGroup &&
+            !item._id.equals(device._id),
+        )
+        .map(displayDevice);
 const compatibleCoverFilter = (names) => {
   const values = [
     ...new Set(
@@ -245,7 +266,19 @@ async function attachDisplayDevices(db, covers) {
   if (!covers.length) return covers;
   const devices = await db
     .collection("devices")
-    .find({}, { projection: { brand: 1, model: 1, aliases: 1, images: 1 } })
+    .find(
+      { status: { $ne: "archived" } },
+      {
+        projection: {
+          brand: 1,
+          model: 1,
+          aliases: 1,
+          images: 1,
+          coverCompatibilityGroup: 1,
+        },
+      },
+    )
+    .sort({ brand: 1, model: 1, _id: 1 })
     .toArray();
   const byName = new Map();
   devices.forEach((device) => {
@@ -253,22 +286,30 @@ async function attachDisplayDevices(db, covers) {
       device.model,
       `${device.brand} ${device.model}`,
       ...(device.aliases || []),
-    ].forEach((name) => byName.set(compatibilityKey(name), device));
+    ].forEach((name) => {
+      const key = compatibilityKey(name);
+      if (!key) return;
+      byName.set(key, [...(byName.get(key) || []), device]);
+    });
   });
   return covers.map((cover) => {
+    const directlyMatchedDevices = (cover.compatibleModels || []).flatMap(
+      (name) => byName.get(compatibilityKey(name)) || [],
+    );
+    // A group is created only for models verified to use the same physical
+    // cover. Once a cover matches one member, the customer-facing list should
+    // include its complete verified family rather than only the stored name.
+    const groupIds = new Set(
+      directlyMatchedDevices
+        .map((device) => device.coverCompatibilityGroup)
+        .filter(Boolean),
+    );
     const matchingDevices = [
       ...new Map(
-        (cover.compatibleModels || [])
-          .map((name) => byName.get(compatibilityKey(name)))
-          .filter(Boolean)
+        [...directlyMatchedDevices, ...devices.filter((device) => groupIds.has(device.coverCompatibilityGroup))]
           .map((device) => [
             device._id.toString(),
-            {
-              id: device._id.toString(),
-              brand: device.brand,
-              model: device.model,
-              images: device.images,
-            },
+            displayDevice(device),
           ]),
       ).values(),
     ];
@@ -491,7 +532,7 @@ app.get(
       db
         .collection("covers")
         .find(filter)
-        .sort({ updatedAt: -1, name: 1, _id: 1 })
+        .sort({ updatedAt: -1, _id: 1 })
         .skip(offset)
         .limit(limit + 1)
         .toArray(),
@@ -524,14 +565,10 @@ app.post(
   "/api/covers",
   authenticated(async (request, response) => {
     const body = request.body || {};
-    const name = String(body.name || "").trim();
-    const sku = String(body.sku || "").trim();
     const compatibleModels = Array.isArray(body.compatibleModels)
-      ? body.compatibleModels.filter(Boolean)
+      ? body.compatibleModels.map((model) => String(model || "").trim()).filter(Boolean)
       : [];
     const startingQuantity = Number(body.startingQuantity || 0);
-    if (!name || !sku)
-      return response.status(400).json({ error: "Name and SKU are required." });
     if (!compatibleModels.length)
       return response
         .status(400)
@@ -543,8 +580,6 @@ app.post(
 
     const now = new Date();
     const cover = {
-      name,
-      sku,
       quantityOnHand: startingQuantity,
       reorderThreshold: Math.max(0, Number(body.reorderThreshold ?? 3)),
       compatibleModels,
@@ -647,7 +682,12 @@ app.get(
     const brands = await db
       .collection("devices")
       .aggregate([
-        { $match: { brand: { $type: "string", $ne: "" } } },
+        {
+          $match: {
+            status: { $ne: "archived" },
+            brand: { $type: "string", $ne: "" },
+          },
+        },
         { $group: { _id: "$brand", modelCount: { $sum: 1 } } },
         { $project: { _id: 0, brand: "$_id", modelCount: 1 } },
         { $sort: { brand: 1 } },
@@ -662,17 +702,31 @@ app.post(
   authenticated(async (request, response) => {
     const brand = String(request.body?.brand || "").trim();
     const model = String(request.body?.model || "").trim();
+    const imageUrl = String(request.body?.imageUrl || "").trim();
     if (brand.length < 2 || model.length < 1)
       return response.status(400).json({ error: "Enter a brand and model." });
     if (brand.length > 60 || model.length > 100)
       return response
         .status(400)
         .json({ error: "Brand or model is too long." });
+    if (!validImageUrl(imageUrl))
+      return response.status(400).json({ error: "Enter a valid image URL." });
     const db = await getDatabase();
     const existing = await db.collection("devices").findOne({
       brand: { $regex: `^${escapeRegex(brand)}$`, $options: "i" },
       model: { $regex: `^${escapeRegex(model)}$`, $options: "i" },
     });
+    if (existing?.status === "archived") {
+      const restored = await db.collection("devices").findOneAndUpdate(
+        { _id: existing._id },
+        {
+          $set: { status: "active", updatedAt: new Date() },
+          $unset: { archivedAt: "" },
+        },
+        { returnDocument: "after" },
+      );
+      return response.status(201).json(serialize(restored));
+    }
     if (existing)
       return response.status(409).json({
         error: `${existing.brand} ${existing.model} is already in your catalogue.`,
@@ -682,7 +736,7 @@ app.post(
       brand,
       model,
       aliases: [],
-      images: {},
+      images: imageUrl ? { primary: imageUrl } : {},
       source: "manual",
       createdAt: now,
       updatedAt: now,
@@ -691,6 +745,66 @@ app.post(
     response
       .status(201)
       .json(serialize({ _id: inserted.insertedId, ...device }));
+  }),
+);
+
+app.patch(
+  "/api/devices/:id",
+  authenticated(async (request, response) => {
+    if (invalidId(request.params.id))
+      return response.status(400).json({ error: "Invalid device id." });
+    const brand = String(request.body?.brand || "").trim();
+    const model = String(request.body?.model || "").trim();
+    const hasImageUrl = Object.hasOwn(request.body || {}, "imageUrl");
+    const imageUrl = hasImageUrl ? String(request.body.imageUrl || "").trim() : undefined;
+    if (brand.length < 2 || model.length < 1)
+      return response.status(400).json({ error: "Enter a brand and model." });
+    if (brand.length > 60 || model.length > 100)
+      return response
+        .status(400)
+        .json({ error: "Brand or model is too long." });
+    if (hasImageUrl && !validImageUrl(imageUrl))
+      return response.status(400).json({ error: "Enter a valid image URL." });
+
+    const db = await getDatabase();
+    const deviceId = new ObjectId(request.params.id);
+    const device = await db.collection("devices").findOne({
+      _id: deviceId,
+      status: { $ne: "archived" },
+    });
+    if (!device) return response.status(404).json({ error: "Device not found." });
+    const duplicate = await db.collection("devices").findOne({
+      _id: { $ne: deviceId },
+      status: { $ne: "archived" },
+      brand: { $regex: `^${escapeRegex(brand)}$`, $options: "i" },
+      model: { $regex: `^${escapeRegex(model)}$`, $options: "i" },
+    });
+    if (duplicate)
+      return response.status(409).json({
+        error: `${duplicate.brand} ${duplicate.model} is already in your catalogue.`,
+      });
+
+    const aliases = [...new Set([
+      ...(device.aliases || []),
+      device.model,
+      `${device.brand} ${device.model}`,
+    ])].filter((name) => name !== model && name !== `${brand} ${model}`);
+    const updated = await db.collection("devices").findOneAndUpdate(
+      { _id: deviceId },
+      {
+        $set: {
+          brand,
+          model,
+          aliases,
+          ...(hasImageUrl
+            ? { images: { ...(device.images || {}), primary: imageUrl || null } }
+            : {}),
+          updatedAt: new Date(),
+        },
+      },
+      { returnDocument: "after" },
+    );
+    response.json(serialize(updated));
   }),
 );
 
@@ -704,7 +818,10 @@ app.get(
       Number.parseInt(String(request.query.offset), 10) || 0,
       0,
     );
-    const filter = brand ? { brand } : {};
+    const filter = {
+      status: { $ne: "archived" },
+      ...(brand ? { brand } : {}),
+    };
     const [devices, total] = await Promise.all([
       db
         .collection("devices")
@@ -724,7 +841,10 @@ app.get(
     const familyDevices = compatibilityGroups.length
       ? await db
           .collection("devices")
-          .find({ coverCompatibilityGroup: { $in: compatibilityGroups } })
+          .find({
+            status: { $ne: "archived" },
+            coverCompatibilityGroup: { $in: compatibilityGroups },
+          })
           .toArray()
       : [];
     const names = [
@@ -749,7 +869,11 @@ app.get(
         ),
         coverVariants: matchingCovers.length,
       };
-      return serialize({ ...device, inventory });
+      return serialize({
+        ...device,
+        inventory,
+        compatibleDevices: compatibleFamilyDevices(device, familyDevices),
+      });
     });
     response.json({
       items: serialized,
@@ -767,13 +891,19 @@ app.get(
     const db = await getDatabase();
     const device = await db
       .collection("devices")
-      .findOne({ _id: new ObjectId(request.params.id) });
+      .findOne({
+        _id: new ObjectId(request.params.id),
+        status: { $ne: "archived" },
+      });
     if (!device)
       return response.status(404).json({ error: "Device not found." });
     const familyDevices = device.coverCompatibilityGroup
       ? await db
           .collection("devices")
-          .find({ coverCompatibilityGroup: device.coverCompatibilityGroup })
+          .find({
+            status: { $ne: "archived" },
+            coverCompatibilityGroup: device.coverCompatibilityGroup,
+          })
           .sort({ brand: 1, model: 1 })
           .toArray()
       : [];
@@ -788,7 +918,7 @@ app.get(
       ),
     ];
     const covers = await findCompatibleCovers(db, names)
-      .sort({ quantityOnHand: -1, name: 1 })
+      .sort({ quantityOnHand: -1, _id: 1 })
       .toArray();
     const displayCovers = await attachDisplayDevices(db, covers);
     // Compatibility is primarily defined by the cover record itself. The
@@ -807,6 +937,177 @@ app.get(
       device: serialize(device),
       covers: displayCovers.map(serialize),
       compatibleDevices,
+    });
+  }),
+);
+
+app.delete(
+  "/api/devices/:id",
+  authenticated(async (request, response) => {
+    if (invalidId(request.params.id))
+      return response.status(400).json({ error: "Invalid device id." });
+    const db = await getDatabase();
+    const result = await db.collection("devices").updateOne(
+      { _id: new ObjectId(request.params.id), status: { $ne: "archived" } },
+      {
+        $set: { status: "archived", archivedAt: new Date(), updatedAt: new Date() },
+        $unset: { coverCompatibilityGroup: "" },
+      },
+    );
+    if (!result.matchedCount)
+      return response.status(404).json({ error: "Device not found." });
+    response.status(204).end();
+  }),
+);
+
+app.post(
+  "/api/devices/:deviceId/compatible-devices/:compatibleDeviceId",
+  authenticated(async (request, response) => {
+    const { deviceId, compatibleDeviceId } = request.params;
+    if (invalidId(deviceId) || invalidId(compatibleDeviceId))
+      return response.status(400).json({ error: "Invalid phone id." });
+    if (deviceId === compatibleDeviceId)
+      return response.status(400).json({ error: "Choose a different phone model." });
+
+    const db = await getDatabase();
+    const [device, compatibleDevice] = await Promise.all([
+      db.collection("devices").findOne({
+        _id: new ObjectId(deviceId),
+        status: { $ne: "archived" },
+      }),
+      db
+        .collection("devices")
+        .findOne({
+          _id: new ObjectId(compatibleDeviceId),
+          status: { $ne: "archived" },
+        }),
+    ]);
+    if (!device || !compatibleDevice)
+      return response.status(404).json({ error: "Phone not found." });
+
+    const sourceGroup = device.coverCompatibilityGroup;
+    const targetGroup = compatibleDevice.coverCompatibilityGroup;
+    if (sourceGroup && sourceGroup === targetGroup) {
+      const devices = await db
+        .collection("devices")
+        .find({
+          status: { $ne: "archived" },
+          coverCompatibilityGroup: sourceGroup,
+        })
+        .sort({ brand: 1, model: 1 })
+        .toArray();
+      return response.json({
+        linked: false,
+        compatibleDevices: devices
+          .filter((item) => !item._id.equals(device._id))
+          .map(serialize),
+      });
+    }
+
+    // A compatibility group is an equivalence class: joining two models also
+    // joins every model already verified to share either model's cover.
+    const groupId =
+      sourceGroup || targetGroup || `manual-${new ObjectId().toHexString()}`;
+    const existingGroups = [sourceGroup, targetGroup].filter(Boolean);
+    const members = existingGroups.length
+      ? {
+          $or: [
+            {
+              _id: {
+                $in: [device._id, compatibleDevice._id],
+              },
+            },
+            { coverCompatibilityGroup: { $in: existingGroups } },
+          ],
+        }
+      : { _id: { $in: [device._id, compatibleDevice._id] } };
+    await db.collection("devices").updateMany(members, {
+      $set: { coverCompatibilityGroup: groupId, updatedAt: new Date() },
+    });
+    const devices = await db
+      .collection("devices")
+        .find({
+          status: { $ne: "archived" },
+          coverCompatibilityGroup: groupId,
+        })
+      .sort({ brand: 1, model: 1 })
+      .toArray();
+    response.status(201).json({
+      linked: true,
+      compatibleDevices: devices
+        .filter((item) => !item._id.equals(device._id))
+        .map(serialize),
+    });
+  }),
+);
+
+app.post(
+  "/api/devices/:deviceId/compatible-devices/:compatibleDeviceId/unlink",
+  authenticated(async (request, response) => {
+    const { deviceId, compatibleDeviceId } = request.params;
+    if (invalidId(deviceId) || invalidId(compatibleDeviceId))
+      return response.status(400).json({ error: "Invalid phone id." });
+
+    const db = await getDatabase();
+    const [device, compatibleDevice] = await Promise.all([
+      db.collection("devices").findOne({
+        _id: new ObjectId(deviceId),
+        status: { $ne: "archived" },
+      }),
+      db
+        .collection("devices")
+        .findOne({
+          _id: new ObjectId(compatibleDeviceId),
+          status: { $ne: "archived" },
+        }),
+    ]);
+    if (!device || !compatibleDevice)
+      return response.status(404).json({ error: "Phone not found." });
+    if (
+      !device.coverCompatibilityGroup ||
+      device.coverCompatibilityGroup !== compatibleDevice.coverCompatibilityGroup
+    )
+      return response.json({ linked: false, compatibleDevices: [] });
+
+    const groupId = device.coverCompatibilityGroup;
+    const members = await db
+      .collection("devices")
+      .find({
+        status: { $ne: "archived" },
+        coverCompatibilityGroup: groupId,
+      })
+      .toArray();
+    const now = new Date();
+    if (members.length <= 2) {
+      // Removing either member from a pair leaves no compatibility family.
+      await db.collection("devices").updateMany(
+        { coverCompatibilityGroup: groupId },
+        { $unset: { coverCompatibilityGroup: "" }, $set: { updatedAt: now } },
+      );
+    } else {
+      // Groups are transitive: detach the selected model from the whole family
+      // while preserving the relationships among the remaining models.
+      await db.collection("devices").updateOne(
+        { _id: compatibleDevice._id },
+        { $unset: { coverCompatibilityGroup: "" }, $set: { updatedAt: now } },
+      );
+    }
+    const remaining =
+      members.length <= 2
+        ? []
+        : await db
+            .collection("devices")
+            .find({
+              status: { $ne: "archived" },
+              coverCompatibilityGroup: groupId,
+            })
+            .sort({ brand: 1, model: 1 })
+            .toArray();
+    response.json({
+      linked: true,
+      compatibleDevices: remaining
+        .filter((item) => !item._id.equals(device._id))
+        .map(serialize),
     });
   }),
 );
@@ -834,13 +1135,19 @@ app.post(
     const db = await getDatabase();
     const device = await db
       .collection("devices")
-      .findOne({ _id: new ObjectId(request.params.id) });
+      .findOne({
+        _id: new ObjectId(request.params.id),
+        status: { $ne: "archived" },
+      });
     if (!device)
       return response.status(404).json({ error: "Phone not found." });
     const familyDevices = device.coverCompatibilityGroup
       ? await db
           .collection("devices")
-          .find({ coverCompatibilityGroup: device.coverCompatibilityGroup })
+          .find({
+            status: { $ne: "archived" },
+            coverCompatibilityGroup: device.coverCompatibilityGroup,
+          })
           .toArray()
       : [device];
     const compatibleModels = deviceNames(device, familyDevices);
@@ -851,8 +1158,6 @@ app.post(
     if (!cover && delta > 0) {
       const now = new Date();
       const newCover = {
-        name: `${device.brand} ${device.model} cover`,
-        sku: `PHONE-${device._id.toString()}`,
         quantityOnHand: 0,
         reorderThreshold: 0,
         compatibleModels,
@@ -911,11 +1216,7 @@ app.get(
         .find({
           status: "active",
           ...(brandPattern ? { compatibleModels: brandPattern } : {}),
-          $or: [
-            { name: pattern },
-            { sku: pattern },
-            { compatibleModels: pattern },
-          ],
+          compatibleModels: pattern,
         })
         .sort({ quantityOnHand: -1 })
         .skip(offset)
@@ -924,6 +1225,7 @@ app.get(
       db
         .collection("devices")
         .find({
+          status: { $ne: "archived" },
           ...(brandPattern
             ? { brand: { $regex: `^${brandPattern.$regex}$`, $options: "i" } }
             : {}),
@@ -945,7 +1247,10 @@ app.get(
     const familyDevices = compatibilityGroups.length
       ? await db
           .collection("devices")
-          .find({ coverCompatibilityGroup: { $in: compatibilityGroups } })
+          .find({
+            status: { $ne: "archived" },
+            coverCompatibilityGroup: { $in: compatibilityGroups },
+          })
           .toArray()
       : [];
     const inventoryNames = [
@@ -974,6 +1279,7 @@ app.get(
           ),
           coverVariants: matchingCovers.length,
         },
+        compatibleDevices: compatibleFamilyDevices(device, familyDevices),
       });
     });
     response.json({
@@ -1013,8 +1319,6 @@ app.get(
     if (query)
       transactions = transactions.filter((transaction) =>
         [
-          transaction.coverName,
-          transaction.coverSku,
           ...(transaction.compatibleModels || []),
         ].some((value) =>
           String(value || "")
@@ -1058,10 +1362,16 @@ app.get(
     if (!transaction)
       return response.status(404).json({ error: "Transaction not found." });
     const cover = await db.collection("covers").findOne({ _id: coverId });
-    const displayDevice = cover
-      ? (await attachDisplayDevices(db, [cover]))[0].displayDevice
+    const displayCover = cover
+      ? (await attachDisplayDevices(db, [cover]))[0]
       : undefined;
-    response.json(serialize({ ...transaction, displayDevice }));
+    response.json(
+      serialize({
+        ...transaction,
+        displayDevice: displayCover?.displayDevice,
+        compatibleDevices: displayCover?.compatibleDevices || [],
+      }),
+    );
   }),
 );
 
@@ -1192,7 +1502,7 @@ app.use((error, _, response, __) => {
     return response.status(409).json({
       error: error.keyPattern?.phone
         ? "An account already uses this phone number."
-        : "That SKU or device already exists.",
+        : "That record already exists.",
     });
   console.error(error);
   response
