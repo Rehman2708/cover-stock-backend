@@ -55,10 +55,12 @@ async function consolidateCompatibilityGroupStock(
   const names = uniqueModelNames(members.map(canonicalDeviceName));
   if (!names.length) return null;
   const nameKeys = new Set(names.map(coverModelKey));
-  const covers = (await db
-    .collection("covers")
-    .find({ status: "active", compatibleModels: { $exists: true } })
-    .toArray()).filter((cover: any) =>
+  const covers = (
+    await db
+      .collection("covers")
+      .find({ status: "active", compatibleModels: { $exists: true } })
+      .toArray()
+  ).filter((cover: any) =>
     (cover.compatibleModels || []).some((model: unknown) =>
       nameKeys.has(coverModelKey(model)),
     ),
@@ -92,7 +94,9 @@ async function consolidateCompatibilityGroupStock(
     const byCreatedAt =
       new Date(left.createdAt || 0).getTime() -
       new Date(right.createdAt || 0).getTime();
-    return byCreatedAt || left._id.toString().localeCompare(right._id.toString());
+    return (
+      byCreatedAt || left._id.toString().localeCompare(right._id.toString())
+    );
   });
   const canonical = ordered[0];
   const quantityOnHand = covers.reduce(
@@ -100,13 +104,16 @@ async function consolidateCompatibilityGroupStock(
     0,
   );
   const reorderThreshold = Math.max(
-    ...covers.map((cover: any) => Math.max(0, Number(cover.reorderThreshold || 0))),
+    ...covers.map((cover: any) =>
+      Math.max(0, Number(cover.reorderThreshold || 0)),
+    ),
   );
   const activity = covers
     .flatMap((cover: any) => cover.activity || [])
     .map((item: any) => ({ ...item, _id: item._id || new ObjectId() }));
   const recordedDelta = activity.reduce(
-    (total: number, item: any) => total + (Number.isInteger(item.quantityDelta) ? item.quantityDelta : 0),
+    (total: number, item: any) =>
+      total + (Number.isInteger(item.quantityDelta) ? item.quantityDelta : 0),
     0,
   );
   const openingBalance = quantityOnHand - recordedDelta;
@@ -128,7 +135,9 @@ async function consolidateCompatibilityGroupStock(
     const byCreatedAt =
       new Date(left.createdAt || 0).getTime() -
       new Date(right.createdAt || 0).getTime();
-    return byCreatedAt || left._id.toString().localeCompare(right._id.toString());
+    return (
+      byCreatedAt || left._id.toString().localeCompare(right._id.toString())
+    );
   });
   let balance = 0;
   const mergedActivity = activity.map((item: any) => {
@@ -175,7 +184,10 @@ async function consolidateCompatibilityGroupStock(
 async function reconcileCompatibleCoverStock(db: any) {
   const members = await db
     .collection("devices")
-    .find({ status: { $ne: "archived" }, coverCompatibilityGroup: { $type: "string" } })
+    .find({
+      status: { $ne: "archived" },
+      coverCompatibilityGroup: { $type: "string" },
+    })
     .toArray();
   const groups = new Map<string, any[]>();
   members.forEach((device: any) => {
@@ -263,10 +275,9 @@ async function splitCompatibilityGroupStock(
   };
   if (remainingMembers.length <= 1)
     sharedUpdate.$unset = { coverCompatibilityGroup: "" };
-  await db.collection("covers").updateOne(
-    { _id: sharedCover._id },
-    sharedUpdate,
-  );
+  await db
+    .collection("covers")
+    .updateOne({ _id: sharedCover._id }, sharedUpdate);
   const detachedCover = {
     quantityOnHand: 0,
     reorderThreshold: Math.max(0, Number(sharedCover.reorderThreshold || 0)),
@@ -284,7 +295,68 @@ async function splitCompatibilityGroupStock(
     updatedAt: now,
   };
   const inserted = await db.collection("covers").insertOne(detachedCover);
-  return { retainedCoverId: sharedCover._id, detachedCoverId: inserted.insertedId };
+  return {
+    retainedCoverId: sharedCover._id,
+    detachedCoverId: inserted.insertedId,
+  };
+}
+
+// Deleting a linked catalogue device is different from unlinking it: there is
+// no remaining device page that should receive a new zero-stock record. Keep
+// the shared balance with the surviving family and remove the archived phone
+// from the active cover's fitment names.
+async function removeDeletedDeviceFromCompatibilityStock(
+  db: any,
+  groupId: string,
+  deletedDevice: any,
+  members: any[],
+  actor = "System",
+) {
+  const remainingMembers = members.filter(
+    (member) => !member._id.equals(deletedDevice._id),
+  );
+  if (!remainingMembers.length) return null;
+  await consolidateCompatibilityGroupStock(db, groupId, members);
+  const sharedCover = await db.collection("covers").findOne({
+    status: "active",
+    coverCompatibilityGroup: groupId,
+  });
+  if (!sharedCover) return null;
+  const deletedModels = coverModelsForDevice(
+    deletedDevice,
+    sharedCover.compatibleModels || [],
+  );
+  const deletedKeys = new Set(deletedModels.map(coverModelKey));
+  const compatibleModels = uniqueModelNames([
+    ...(sharedCover.compatibleModels || []).filter(
+      (model: unknown) => !deletedKeys.has(coverModelKey(model)),
+    ),
+    ...remainingMembers.map(canonicalDeviceName),
+  ]);
+  const now = new Date();
+  const balance = Number(sharedCover.quantityOnHand || 0);
+  const change = {
+    _id: new ObjectId(),
+    type: "compatibility_unlink",
+    quantityDelta: 0,
+    quantityBefore: balance,
+    quantityAfter: balance,
+    reason: null,
+    note: `${canonicalDeviceName(deletedDevice)} was removed from the catalogue; shared stock stayed with the remaining compatible phone${remainingMembers.length === 1 ? "" : "s"}.`,
+    actor,
+    createdAt: now,
+  };
+  const update: any = {
+    $set: {
+      compatibleModels,
+      activity: [...(sharedCover.activity || []), change],
+      updatedAt: now,
+    },
+  };
+  if (remainingMembers.length <= 1)
+    update.$unset = { coverCompatibilityGroup: "" };
+  await db.collection("covers").updateOne({ _id: sharedCover._id }, update);
+  return sharedCover._id;
 }
 
 async function getDatabase() {
@@ -328,7 +400,10 @@ async function reconcileDeviceIdentities(db: any) {
   for (const matches of groups.values()) {
     const ordered = [...matches].sort((left, right) => {
       const qualityDifference = deviceQuality(right) - deviceQuality(left);
-      return qualityDifference || left._id.toString().localeCompare(right._id.toString());
+      return (
+        qualityDifference ||
+        left._id.toString().localeCompare(right._id.toString())
+      );
     });
     const canonical = ordered[0];
     const identity = canonicalDevice(canonical.brand, canonical.model);
@@ -358,7 +433,9 @@ async function reconcileDeviceIdentities(db: any) {
           $set: {
             ...identity,
             aliases,
-            ...(compatibilityGroup ? { coverCompatibilityGroup: compatibilityGroup } : {}),
+            ...(compatibilityGroup
+              ? { coverCompatibilityGroup: compatibilityGroup }
+              : {}),
             ...(canonical.images || imageSource?.images
               ? {
                   images: {
@@ -428,13 +505,15 @@ async function ensureIndexes() {
     }),
     db.collection("transactions").createIndex({ coverId: 1, createdAt: -1 }),
     db.collection("transactions").createIndex({ createdAt: -1 }),
-    db.collection("devices").createIndex(
-      { brand: 1, model: 1 },
-      { name: "device_display_sort" },
-    ),
     db
       .collection("devices")
-      .createIndex({ brandKey: 1, modelKey: 1 }, { unique: true, sparse: true }),
+      .createIndex({ brand: 1, model: 1 }, { name: "device_display_sort" }),
+    db
+      .collection("devices")
+      .createIndex(
+        { brandKey: 1, modelKey: 1 },
+        { unique: true, sparse: true },
+      ),
     db
       .collection("devices")
       .createIndex(
@@ -457,5 +536,6 @@ module.exports = {
   consolidateCompatibilityGroupStock,
   ensureIndexes,
   getDatabase,
+  removeDeletedDeviceFromCompatibilityStock,
   splitCompatibilityGroupStock,
 };
