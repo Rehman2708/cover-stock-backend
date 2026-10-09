@@ -6,7 +6,6 @@
     "start": "tsx index.ts",
     "dev": "tsx watch index.ts",
     "import:catalog": "tsx import-catalog.ts",
-    "sync:cover-compatibility": "tsx sync-cover-compatibility.ts",
     "test": "node --test",
     "typecheck": "tsc --noEmit"
   },

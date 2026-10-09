@@ -1,4 +1,5 @@
 const { getDatabase } = require("../database");
+const { canonicalDevice, uniqueNames } = require("../deviceIdentity");
 import {
   aliasesFor,
   MobileApiClient,
@@ -96,10 +97,10 @@ function imageDataUri(base64?: string) {
 }
 
 function deviceRecord(device: MobileApiDevice, brand: string) {
+  const identity = canonicalDevice(brand, device.name);
   return {
-    brand,
-    model: device.name.trim(),
-    aliases: aliasesFor(device),
+    ...identity,
+    aliases: uniqueNames([...aliasesFor(device), device.name]),
     source: { provider: "mobileapi", externalId: String(device.id) },
     deviceType: "phone",
     specifications: {
@@ -141,7 +142,7 @@ async function saveDevices(
   includeImages: boolean,
   dryRun: boolean,
 ) {
-  const operations = [];
+  const records = new Map<string, ReturnType<typeof deviceRecord>>();
   let imagesUpdated = 0;
   for (const device of devices) {
     const brand = phoneBrand(device);
@@ -154,22 +155,28 @@ async function saveDevices(
         imagesUpdated += 1;
       }
     }
-    operations.push({
+    const key = `${record.brandKey}\u0000${record.modelKey}`;
+    const previous = records.get(key);
+    records.set(key, {
+      ...record,
+      aliases: uniqueNames([...(previous?.aliases || []), ...record.aliases]),
+    });
+  }
+  const operations = [...records.values()].map((record) => ({
       updateOne: {
         filter: {
           $or: [
             {
               "source.provider": "mobileapi",
-              "source.externalId": String(device.id),
+              "source.externalId": record.source.externalId,
             },
-            { brand: record.brand, model: record.model },
+            { brandKey: record.brandKey, modelKey: record.modelKey },
           ],
         },
         update: { $set: record, $setOnInsert: { createdAt: new Date() } },
         upsert: true,
       },
-    });
-  }
+    }));
   if (!dryRun && operations.length)
     await database
       .collection("devices")
