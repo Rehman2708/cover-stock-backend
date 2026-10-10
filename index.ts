@@ -11,6 +11,10 @@ const {
   splitCompatibilityGroupStock,
 } = require("./src/database");
 const { canonicalDevice } = require("./src/deviceIdentity");
+const {
+  fuzzySearchPattern,
+  sortDevicesBySearchMatch,
+} = require("./src/searchRanking");
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -298,7 +302,7 @@ async function canonicalCompatibleModels(db, values) {
   };
 }
 
-async function attachDisplayDevices(db, covers) {
+async function attachDisplayDevices(db, covers, preferredQuery = "") {
   if (!covers.length) return covers;
   const devices = await db
     .collection("devices")
@@ -341,14 +345,18 @@ async function attachDisplayDevices(db, covers) {
           ...devices.filter((device) =>
             groupIds.has(device.coverCompatibilityGroup),
           ),
-        ].map((device) => [device._id.toString(), displayDevice(device)]),
+        ].map((device) => [device._id.toString(), device]),
       ).values(),
     ];
-    return matchingDevices.length
+    const rankedDevices = sortDevicesBySearchMatch(
+      matchingDevices,
+      preferredQuery,
+    );
+    return rankedDevices.length
       ? {
           ...cover,
-          displayDevice: matchingDevices[0],
-          compatibleDevices: matchingDevices,
+          displayDevice: displayDevice(rankedDevices[0]),
+          compatibleDevices: rankedDevices.map(displayDevice),
         }
       : cover;
   });
@@ -1071,6 +1079,12 @@ app.get(
     const db = await getDatabase();
     const brand = String(request.query.brand || "").trim();
     const sort = String(request.query.sort || "model_asc");
+    const requestedStock = String(request.query.stock || "all");
+    const stock = ["all", "in_stock", "out_of_stock"].includes(
+      requestedStock,
+    )
+      ? requestedStock
+      : "all";
     const limit = safeLimit(request.query.limit, 50, 100);
     const offset = Math.max(
       Number.parseInt(String(request.query.offset), 10) || 0,
@@ -1084,6 +1098,75 @@ app.get(
       sort === "model_desc"
         ? { brand: -1, model: -1, _id: -1 }
         : { brand: 1, model: 1, _id: 1 };
+    if (stock !== "all") {
+      // Inventory is calculated from compatible covers, including every member
+      // of a compatibility group. Filter after that calculation so the result
+      // matches the availability shown on each device card.
+      const candidates = await db
+        .collection("devices")
+        .find(filter)
+        .sort(deviceSort)
+        .toArray();
+      const compatibilityGroups = [
+        ...new Set(
+          candidates
+            .map((device) => device.coverCompatibilityGroup)
+            .filter(Boolean),
+        ),
+      ];
+      const familyDevices = compatibilityGroups.length
+        ? await db
+            .collection("devices")
+            .find({
+              status: { $ne: "archived" },
+              coverCompatibilityGroup: { $in: compatibilityGroups },
+            })
+            .toArray()
+        : [];
+      const names = [
+        ...new Set(
+          candidates.flatMap((device) => deviceNames(device, familyDevices)),
+        ),
+      ];
+      const covers = names.length
+        ? await findCompatibleCovers(db, names).toArray()
+        : [];
+      const matchingDevices = candidates
+        .map((device) => {
+          const compatibleNames = new Set(
+            deviceNames(device, familyDevices).map(compatibilityKey),
+          );
+          const matchingCovers = covers.filter((cover) =>
+            cover.compatibleModels?.some((model) =>
+              compatibleNames.has(compatibilityKey(model)),
+            ),
+          );
+          const inventory = {
+            unitsOnHand: matchingCovers.reduce(
+              (total, cover) => total + cover.quantityOnHand,
+              0,
+            ),
+            coverVariants: matchingCovers.length,
+          };
+          return serialize({
+            ...device,
+            inventory,
+            compatibleDevices: compatibleFamilyDevices(device, familyDevices),
+          });
+        })
+        .filter((device) =>
+          stock === "in_stock"
+            ? device.inventory.unitsOnHand > 0
+            : device.inventory.unitsOnHand === 0,
+        );
+      const items = matchingDevices.slice(offset, offset + limit);
+      return response.json({
+        items,
+        nextOffset:
+          matchingDevices.length > offset + limit ? offset + limit : null,
+        total: matchingDevices.length,
+      });
+    }
     const [devices, total] = await Promise.all([
       db
         .collection("devices")
@@ -1593,6 +1676,13 @@ app.get(
       0,
     );
     const pattern = { $regex: escapeRegex(query), $options: "i" };
+    // A minimum of three characters keeps the forgiving fallback focused while
+    // still allowing "y19se" and common abbreviated/typoed searches such as
+    // "viy9" to find "Vivo Y19 SE".
+    const fuzzyQueryPattern = fuzzySearchPattern(query);
+    const fuzzyPattern = fuzzyQueryPattern
+      ? { $regex: fuzzyQueryPattern, $options: "i" }
+      : null;
     const brandPattern = brand
       ? { $regex: escapeRegex(brand), $options: "i" }
       : null;
@@ -1607,13 +1697,71 @@ app.get(
           ? { compatibleModels: -1, _id: -1 }
           : { quantityOnHand: -1, _id: 1 };
     const db = await getDatabase();
+    const deviceMatchClauses: any[] = [
+      { brand: pattern },
+      { model: pattern },
+      { aliases: pattern },
+    ];
+    if (fuzzyPattern) {
+      deviceMatchClauses.push(
+        {
+          $expr: {
+            $regexMatch: {
+              input: {
+                $concat: [
+                  { $ifNull: ["$brand", ""] },
+                  " ",
+                  { $ifNull: ["$model", ""] },
+                ],
+              },
+              regex: fuzzyPattern.$regex,
+              options: "i",
+            },
+          },
+        },
+        { aliases: fuzzyPattern },
+      );
+    }
+    const deviceFilter = {
+      status: { $ne: "archived" },
+      ...(brandPattern
+        ? { brand: { $regex: `^${brandPattern.$regex}$`, $options: "i" } }
+        : {}),
+      $or: deviceMatchClauses,
+    };
+    const deviceResults =
+      sort === "relevance"
+        ? db
+            .collection("devices")
+            .find(deviceFilter)
+            .toArray()
+            .then((devices) =>
+              sortDevicesBySearchMatch(devices, query).slice(
+                offset,
+                offset + limit + 1,
+              ),
+            )
+        : db
+            .collection("devices")
+            .find(deviceFilter)
+            .sort(deviceSort)
+            .skip(offset)
+            .limit(limit + 1)
+            .toArray();
     const [covers, devices] = await Promise.all([
       db
         .collection("covers")
         .find({
           status: "active",
           $and: [
-            { compatibleModels: pattern },
+            fuzzyPattern
+              ? {
+                  $or: [
+                    { compatibleModels: pattern },
+                    { compatibleModels: fuzzyPattern },
+                  ],
+                }
+              : { compatibleModels: pattern },
             ...(brandPattern ? [{ compatibleModels: brandPattern }] : []),
           ],
         })
@@ -1621,19 +1769,7 @@ app.get(
         .skip(offset)
         .limit(limit + 1)
         .toArray(),
-      db
-        .collection("devices")
-        .find({
-          status: { $ne: "archived" },
-          ...(brandPattern
-            ? { brand: { $regex: `^${brandPattern.$regex}$`, $options: "i" } }
-            : {}),
-          $or: [{ brand: pattern }, { model: pattern }, { aliases: pattern }],
-        })
-        .sort(deviceSort)
-        .skip(offset)
-        .limit(limit + 1)
-        .toArray(),
+      deviceResults,
     ]);
     const visibleDevices = devices.slice(0, limit);
     const compatibilityGroups = [
@@ -1682,7 +1818,7 @@ app.get(
       });
     });
     response.json({
-      covers: (await attachDisplayDevices(db, covers.slice(0, limit))).map(
+      covers: (await attachDisplayDevices(db, covers.slice(0, limit), query)).map(
         serialize,
       ),
       devices: serializedDevices,
